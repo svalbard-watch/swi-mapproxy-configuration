@@ -96,8 +96,9 @@ jobs:
       - name: Render and load the configuration
         env:
           IMAGE: ${{ matrix.image }}
+          BRANCH: ${{ matrix.branch }}
         run: |
-          echo "Validating against $IMAGE (${{ matrix.branch }})"
+          echo "Validating against $IMAGE ($BRANCH)"
           docker run --rm \
             -e MAPPROXY_REDIS_HOST=redis.invalid -e MAPPROXY_REDIS_PORT=6379 \
             -e MAPPROXY_REDIS_USERNAME=ci -e MAPPROXY_REDIS_PASSWORD=ci \

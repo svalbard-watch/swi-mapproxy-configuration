@@ -4,7 +4,7 @@ name: Validate MapProxy config
 # renders mapproxy.yaml with envsubst. A configuration MapProxy cannot load keeps the
 # container from starting, so a merge here can take the map server down at its next
 # restart. This check loads the configuration the same way production does, with the
-# MapProxy version that is actually deployed, before it can be merged.
+# MapProxy versions that are actually deployed (main and pre-prod), before it can be merged.
 
 on:
   pull_request:
@@ -20,38 +20,85 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  images:
+    name: Find deployed MapProxy images
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.find.outputs.matrix }}
+    steps:
+      # The deployment repository may describe an environment as a Swarm stack file or as a
+      # Compose file, so try each known name per branch and use the first one that contains
+      # a swi-mapproxy image. The organisation in the image path is always replaced with
+      # svalbard-watch, because the rename may not have landed in the deployment files yet.
+      - name: Find the MapProxy image on each deployment branch
+        id: find
+        run: |
+          set -euo pipefail
+          BASE=https://raw.githubusercontent.com/svalbard-watch/swi-production-deployment
+          Q="'"
+          PATTERN="ghcr\.io/[^/[:space:]\"$Q]+/swi-mapproxy(:[^[:space:]\"$Q]+)?"
+          RESULT='[]'
+          for BRANCH in main pre-prod; do
+            IMAGE=""
+            for FILE in stack.yaml stack.yml compose.yml compose.yaml; do
+              if curl -fsSL "$BASE/$BRANCH/$FILE" -o "$RUNNER_TEMP/deployment.yml" 2>/dev/null; then
+                CANDIDATE="$(grep -ioE "$PATTERN" "$RUNNER_TEMP/deployment.yml" | head -n 1 || true)"
+                if [ -z "$CANDIDATE" ]; then
+                  echo "$BRANCH/$FILE exists but has no swi-mapproxy image, trying next"
+                  continue
+                fi
+                echo "Found $CANDIDATE in $BRANCH/$FILE"
+                # Force the organisation (and repository name) to svalbard-watch, lowercase,
+                # whatever the file says. The tag is left untouched.
+                CANDIDATE="$(printf '%s' "$CANDIDATE" | sed -E 's#^ghcr\.io/[^/]+/swi-mapproxy#ghcr.io/svalbard-watch/swi-mapproxy#I')"
+                # Resolve ${VAR:-default} / ${VAR-default} in the tag to the default value.
+                CANDIDATE="$(printf '%s' "$CANDIDATE" | sed -E 's/\$\{[A-Za-z_][A-Za-z0-9_]*:?-([^}]*)\}/\1/g')"
+                if printf '%s' "$CANDIDATE" | grep -q '\$'; then
+                  echo "::warning::$BRANCH/$FILE image '$CANDIDATE' contains an unresolved variable, trying next"
+                  continue
+                fi
+                echo "Using $CANDIDATE for $BRANCH"
+                IMAGE="$CANDIDATE"
+                break
+              fi
+            done
+            if [ -z "$IMAGE" ]; then
+              echo "::warning::no usable swi-mapproxy image found on branch $BRANCH"
+              continue
+            fi
+            RESULT="$(jq -c --arg b "$BRANCH" --arg i "$IMAGE" '. + [{branch: $b, image: $i}]' <<<"$RESULT")"
+          done
+          if [ "$(jq 'length' <<<"$RESULT")" -eq 0 ]; then
+            echo "::error::no swi-mapproxy image found on main or pre-prod of swi-production-deployment"
+            exit 1
+          fi
+          echo "matrix=$(jq -c '{include: .}' <<<"$RESULT")" >> "$GITHUB_OUTPUT"
+
   validate:
-    name: Validate mapproxy.yaml
+    name: Validate mapproxy.yaml (${{ matrix.branch }})
+    needs: images
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.images.outputs.matrix) }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
 
-      - name: Find the MapProxy image deployed in production
-        id: image
-        run: |
-          set -euo pipefail
-          curl -fsSL https://raw.githubusercontent.com/UNIS-Svalbard-Weather-Information/swi-production-deployment/main/compose.yml \
-            > "$RUNNER_TEMP/compose.yml"
-          IMAGE="$(grep -oE 'ghcr.io/unis-svalbard-weather-information/swi-mapproxy:[^[:space:]]+' "$RUNNER_TEMP/compose.yml" | head -n 1)"
-          if [ -z "$IMAGE" ]; then
-            echo "::error::no swi-mapproxy image found in swi-production-deployment compose.yml"
-            exit 1
-          fi
-          echo "Validating against $IMAGE"
-          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
-
-      # Rendered and loaded inside the production image, so envsubst and MapProxy are the
-      # ones production uses (run.sh substitutes the whole file, like here). The four
+      # Rendered and loaded inside the deployed image, so envsubst and MapProxy are the
+      # ones that environment uses (run.sh substitutes the whole file, like here). The four
       # variables are the Redis settings the deployment injects; dummy values are enough
       # because capabilities documents do not connect to Redis.
       - name: Render and load the configuration
         env:
-          IMAGE: ${{ steps.image.outputs.image }}
+          IMAGE: ${{ matrix.image }}
+          BRANCH: ${{ matrix.branch }}
         run: |
+          echo "Validating against $IMAGE ($BRANCH)"
           docker run --rm \
             -e MAPPROXY_REDIS_HOST=redis.invalid -e MAPPROXY_REDIS_PORT=6379 \
             -e MAPPROXY_REDIS_USERNAME=ci -e MAPPROXY_REDIS_PASSWORD=ci \

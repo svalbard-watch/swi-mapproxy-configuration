@@ -30,15 +30,26 @@ jobs:
         with:
           persist-credentials: false
 
+      # The deployment repository may describe production as a Swarm stack file or as a
+      # Compose file, so try each known name and use the first one that contains the image.
       - name: Find the MapProxy image deployed in production
         id: image
         run: |
           set -euo pipefail
-          curl -fsSL https://raw.githubusercontent.com/UNIS-Svalbard-Weather-Information/swi-production-deployment/main/compose.yml \
-            > "$RUNNER_TEMP/compose.yml"
-          IMAGE="$(grep -oE 'ghcr.io/unis-svalbard-weather-information/swi-mapproxy:[^[:space:]]+' "$RUNNER_TEMP/compose.yml" | head -n 1)"
+          BASE=https://raw.githubusercontent.com/svalbard-watch/swi-production-deployment/main
+          IMAGE=""
+          for FILE in stack.yaml stack.yml compose.yml compose.yaml; do
+            if curl -fsSL "$BASE/$FILE" > "$RUNNER_TEMP/deployment.yml" 2>/dev/null; then
+              IMAGE="$(grep -oE 'ghcr.io/svalbard-watch/swi-mapproxy:[^[:space:]"'"'"']+' "$RUNNER_TEMP/deployment.yml" | head -n 1 || true)"
+              if [ -n "$IMAGE" ]; then
+                echo "Found image in $FILE"
+                break
+              fi
+              echo "$FILE exists but has no swi-mapproxy image, trying next"
+            fi
+          done
           if [ -z "$IMAGE" ]; then
-            echo "::error::no swi-mapproxy image found in swi-production-deployment compose.yml"
+            echo "::error::no swi-mapproxy image found in stack.yaml/stack.yml/compose.yml/compose.yaml of swi-production-deployment"
             exit 1
           fi
           echo "Validating against $IMAGE"

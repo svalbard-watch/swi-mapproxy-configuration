@@ -4,7 +4,7 @@ name: Validate MapProxy config
 # renders mapproxy.yaml with envsubst. A configuration MapProxy cannot load keeps the
 # container from starting, so a merge here can take the map server down at its next
 # restart. This check loads the configuration the same way production does, with the
-# MapProxy versions that are actually deployed (main and preprod), before it can be merged.
+# MapProxy versions that are actually deployed (main and pre-prod), before it can be merged.
 
 on:
   pull_request:
@@ -29,8 +29,8 @@ jobs:
     steps:
       # The deployment repository may describe an environment as a Swarm stack file or as a
       # Compose file, so try each known name per branch and use the first one that contains
-      # a swi-mapproxy image. Any ghcr.io org is accepted, because the deployment files may
-      # still use the old organisation name.
+      # a swi-mapproxy image. The organisation in the image path is always replaced with
+      # svalbard-watch, because the rename may not have landed in the deployment files yet.
       - name: Find the MapProxy image on each deployment branch
         id: find
         run: |
@@ -39,22 +39,26 @@ jobs:
           Q="'"
           PATTERN="ghcr\.io/[^/[:space:]\"$Q]+/swi-mapproxy(:[^[:space:]\"$Q]+)?"
           RESULT='[]'
-          for BRANCH in main preprod; do
+          for BRANCH in main pre-prod; do
             IMAGE=""
             for FILE in stack.yaml stack.yml compose.yml compose.yaml; do
               if curl -fsSL "$BASE/$BRANCH/$FILE" -o "$RUNNER_TEMP/deployment.yml" 2>/dev/null; then
-                CANDIDATE="$(grep -oE "$PATTERN" "$RUNNER_TEMP/deployment.yml" | head -n 1 || true)"
+                CANDIDATE="$(grep -ioE "$PATTERN" "$RUNNER_TEMP/deployment.yml" | head -n 1 || true)"
                 if [ -z "$CANDIDATE" ]; then
                   echo "$BRANCH/$FILE exists but has no swi-mapproxy image, trying next"
                   continue
                 fi
-                # Resolve ${VAR:-default} / ${VAR-default} to the default value.
+                echo "Found $CANDIDATE in $BRANCH/$FILE"
+                # Force the organisation (and repository name) to svalbard-watch, lowercase,
+                # whatever the file says. The tag is left untouched.
+                CANDIDATE="$(printf '%s' "$CANDIDATE" | sed -E 's#^ghcr\.io/[^/]+/swi-mapproxy#ghcr.io/svalbard-watch/swi-mapproxy#I')"
+                # Resolve ${VAR:-default} / ${VAR-default} in the tag to the default value.
                 CANDIDATE="$(printf '%s' "$CANDIDATE" | sed -E 's/\$\{[A-Za-z_][A-Za-z0-9_]*:?-([^}]*)\}/\1/g')"
                 if printf '%s' "$CANDIDATE" | grep -q '\$'; then
                   echo "::warning::$BRANCH/$FILE image '$CANDIDATE' contains an unresolved variable, trying next"
                   continue
                 fi
-                echo "Found $CANDIDATE in $BRANCH/$FILE"
+                echo "Using $CANDIDATE for $BRANCH"
                 IMAGE="$CANDIDATE"
                 break
               fi
@@ -66,7 +70,7 @@ jobs:
             RESULT="$(jq -c --arg b "$BRANCH" --arg i "$IMAGE" '. + [{branch: $b, image: $i}]' <<<"$RESULT")"
           done
           if [ "$(jq 'length' <<<"$RESULT")" -eq 0 ]; then
-            echo "::error::no swi-mapproxy image found on main or preprod of swi-production-deployment"
+            echo "::error::no swi-mapproxy image found on main or pre-prod of swi-production-deployment"
             exit 1
           fi
           echo "matrix=$(jq -c '{include: .}' <<<"$RESULT")" >> "$GITHUB_OUTPUT"
